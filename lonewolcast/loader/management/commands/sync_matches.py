@@ -1,36 +1,58 @@
 from django.core.management.base import BaseCommand
 from loader.match_service import MatchService
-from datetime import datetime, timedelta
+from datetime import datetime
 
 class Command(BaseCommand):
     help = """
     Gestion des matchs de football:
-    1. Synchronisation des matchs depuis une date donnée (--date YYYY-MM-DD)
-    2. Mise à jour des matchs en cours uniquement (--active)
-    3. Suppression de la base de données (--clear)
+    
+    Commandes disponibles:
+        --sync              : Synchronise tous les matchs pour toutes les leagues et saisons configurées
+        --update           : Met à jour uniquement les matchs non terminés
+        --clear           : Supprime toutes les données
+            options:
+            --season YEAR   : Supprime une saison spécifique
+            --league LEAGUE : Supprime une league spécifique (requiert --season)
+            --force        : Ne pas demander de confirmation pour la suppression
+    
+    Exemples:
+        python manage.py sync_matches --sync
+        python manage.py sync_matches --update
+        python manage.py sync_matches --clear --force
+        python manage.py sync_matches --clear --season 2024
+        python manage.py sync_matches --clear --season 2024 --league 39
     """
 
     def add_arguments(self, parser):
-        # Arguments mutuellement exclusifs
-        group = parser.add_mutually_exclusive_group()
+        # Groupe mutuellement exclusif pour les actions principales
+        group = parser.add_mutually_exclusive_group(required=True)
         group.add_argument(
-            '--date',
-            type=str,
-            help='Date de début de synchronisation (format: YYYY-MM-DD). Par défaut: date du jour',
-            default=datetime.now().strftime('%Y-%m-%d')
+            '--sync',
+            action='store_true',
+            help='Synchronise tous les matchs'
         )
         group.add_argument(
-            '--active',
+            '--update',
             action='store_true',
-            help='Mettre à jour uniquement les matchs en cours et à venir'
+            help='Met à jour les matchs non terminés'
         )
         group.add_argument(
             '--clear',
             action='store_true',
-            help='Vider la base de données'
+            help='Supprime des données'
         )
 
-        # Option supplémentaire pour --clear
+        # Arguments pour le nettoyage ciblé
+        parser.add_argument(
+            '--season',
+            type=int,
+            help='Année de la saison à supprimer'
+        )
+        parser.add_argument(
+            '--league',
+            type=int,
+            help='ID de la league à supprimer (requiert --season)'
+        )
         parser.add_argument(
             '--force',
             action='store_true',
@@ -41,106 +63,64 @@ class Command(BaseCommand):
         service = MatchService()
 
         try:
-            # Gestion de la suppression de la base
-            if options['clear']:
-                return self.handle_clear_database(service, options['force'])
-
-            # Gestion des matchs actifs
-            if options['active']:
-                return self.handle_active_matches(service)
-
-            # Synchronisation depuis une date
-            return self.handle_sync_from_date(service, options['date'])
-
+            if options['sync']:
+                self.handle_sync(service)
+            elif options['update']:
+                self.handle_update(service)
+            elif options['clear']:
+                self.handle_clear(service, options)
         except Exception as e:
-            self.stderr.write(
-                self.style.ERROR(f'Erreur inattendue: {str(e)}')
-            )
+            self.stderr.write(self.style.ERROR(f'Erreur: {str(e)}'))
 
-    def handle_clear_database(self, service, force):
-        """Gère la suppression de la base de données."""
+    def handle_sync(self, service):
+        """Gestion de la synchronisation complète."""
+        self.stdout.write(self.style.HTTP_INFO('🔄 Début de la synchronisation...'))
+        total = service.sync_all_matches()
+        self.stdout.write(self.style.SUCCESS(f'✅ {total} match(s) synchronisé(s)'))
+
+    def handle_update(self, service):
+        """Gestion de la mise à jour des matchs non terminés."""
+        self.stdout.write(self.style.HTTP_INFO('🔄 Mise à jour des matchs non terminés...'))
+        updated = service.update_unfinished_matches()
+        self.stdout.write(self.style.SUCCESS(f'✅ {updated} match(s) mis à jour'))
+
+    def handle_clear(self, service, options):
+        """Gestion de la suppression des données."""
+        season = options.get('season')
+        league = options.get('league')
+        force = options.get('force')
+
+        # Validation des arguments
+        if league and not season:
+            self.stderr.write(self.style.ERROR('--league requiert --season'))
+            return
+
+        # Construction du message de confirmation
+        action = "toutes les données"
+        if season:
+            action = f"la saison {season}"
+            if league:
+                action += f" de la league {league}"
+
+        # Demande de confirmation si --force n'est pas utilisé
         if not force:
-            confirm = input('⚠️  Êtes-vous sûr de vouloir vider la base de données ? [y/N]: ')
+            confirm = input(f'⚠️ Voulez-vous vraiment supprimer {action} ? [y/N]: ')
             if confirm.lower() != 'y':
                 self.stdout.write(self.style.SUCCESS('Opération annulée'))
                 return
 
-            confirm2 = input('⚠️  Tapez "CONFIRMER" pour confirmer la suppression: ')
-            if confirm2 != "CONFIRMER":
-                self.stdout.write(self.style.SUCCESS('Opération annulée'))
-                return
+        # Exécution de la suppression
+        self.stdout.write(self.style.WARNING(f'🗑️ Suppression de {action} en cours...'))
+        success = False
 
-        self.stdout.write(self.style.WARNING('🗑️  Suppression de la base de données en cours...'))
-        if service.clear_database():
-            self.stdout.write(self.style.SUCCESS('✅ Base de données vidée avec succès'))
+        if league:
+            success = service.clear_league(season, league)
+        elif season:
+            success = service.clear_season(season)
+        else:
+            success = service.clear_all()
+
+        if success:
+            self.stdout.write(self.style.SUCCESS('✅ Suppression réussie'))
         else:
             self.stderr.write(self.style.ERROR('❌ Erreur lors de la suppression'))
-
-    def handle_active_matches(self, service):
-        """Gère la mise à jour des matchs actifs."""
-        self.stdout.write(self.style.HTTP_INFO('🔄 Recherche des matchs actifs...'))
-        active_matches = service.get_active_matches()
-        
-        if not active_matches:
-            self.stdout.write(self.style.SUCCESS('ℹ️  Aucun match actif trouvé'))
-            return
-
-        total = len(active_matches)
-        self.stdout.write(self.style.HTTP_INFO(f'📊 {total} match(s) actif(s) trouvé(s)'))
-
-        updated = service.update_active_matches()
-        self.stdout.write(
-            self.style.SUCCESS(f'✅ Mise à jour terminée: {updated}/{total} match(s) mis à jour')
-        )
-
-    def handle_sync_from_date(self, service, date_str):
-        """Gère la synchronisation depuis une date donnée."""
-        try:
-            # Validation de la date
-            start_date = datetime.strptime(date_str, '%Y-%m-%d')
-            end_date = datetime.now()
-
-            if start_date > end_date:
-                self.stderr.write(
-                    self.style.ERROR('La date de début ne peut pas être dans le futur')
-                )
-                return
-
-            # Calcul du nombre de jours
-            days_diff = (end_date - start_date).days + 1
-            
-            self.stdout.write(
-                self.style.HTTP_INFO(
-                    f'Début de la synchronisation des matchs du {date_str} au {end_date.strftime("%Y-%m-%d")} '
-                    f'({days_diff} jours)'
-                )
-            )
-            
-            # Synchronisation jour par jour
-            current_date = start_date
-            day_count = 1
-            
-            while current_date <= end_date:
-                current_date_str = current_date.strftime('%Y-%m-%d')
-                self.stdout.write(
-                    self.style.HTTP_INFO(
-                        f'\nJour {day_count}/{days_diff} - {current_date_str}'
-                    )
-                )
-                
-                service.sync_matches(current_date_str)
-                
-                current_date += timedelta(days=1)
-                day_count += 1
-            
-            self.stdout.write(
-                self.style.SUCCESS(
-                    f'\nSynchronisation terminée pour la période du {date_str} '
-                    f'au {end_date.strftime("%Y-%m-%d")}'
-                )
-            )
-            
-        except ValueError:
-            self.stderr.write(
-                self.style.ERROR('Format de date invalide. Utilisez YYYY-MM-DD')
-            )

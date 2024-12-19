@@ -25,7 +25,7 @@ INSTALLED_APPS = [
     "django.contrib.staticfiles",
     "rest_framework",
     "loader",
-    "batch_manager"
+    "metrics"
 ]
 
 MIDDLEWARE = [
@@ -99,9 +99,10 @@ STATICFILES_DIRS = [
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 # API Sports configuration
-API_SPORTS_KEY = config('API_SPORTS_KEY')
-API_SPORTS_BASE_URL = 'https://v3.football.api-sports.io'
 LEAGUES = config('LEAGUES', cast=lambda v: [int(x) for x in v.split(',')])
+SEASON_YEAR = config('SEASON_YEAR', cast=lambda v: [int(x) for x in v.split(',')])
+API_SPORTS_KEY = config('API_SPORTS_KEY')
+API_SPORTS_BASE_URL = config('API_SPORTS_BASE_URL', default='https://v3.football.api-sports.io')
 
 # Firebase Configuration
 FIREBASE_CREDENTIALS_PATH = config('FIREBASE_CREDENTIALS_PATH', default=str(BASE_DIR / "serviceAccountKey.json"))
@@ -115,10 +116,8 @@ firebase_admin.initialize_app(cred, {
 
 # REST Framework settings
 REST_FRAMEWORK = {
-    'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
-    'PAGE_SIZE': 10,
     'DEFAULT_PERMISSION_CLASSES': [
-        'rest_framework.permissions.IsAuthenticated',
+        'rest_framework.permissions.AllowAny',
     ]
 }
 
