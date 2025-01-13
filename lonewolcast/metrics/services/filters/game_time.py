@@ -2,6 +2,7 @@ from .base import BaseFilter
 from typing import List, Dict, Any
 from enum import Enum
 from datetime import datetime, time
+from firebase_admin import db
 
 class GameTimeSlot(Enum):
     SLOT_12_14 = 'slot_12_14'  # 12:00-13:59
@@ -24,15 +25,22 @@ class GameTimeFilter(BaseFilter):
         }
         return ranges[time_slot]
 
-    def apply(self, matches: List[Dict]) -> List[Dict]:
+    def apply(self, ref: db.Reference) -> List[Dict]:
         start_time, end_time = self.get_time_range(self.time_slot)
+        matches = []
         
-        filtered_matches = []
-        for match in matches:
-            match_datetime = datetime.fromtimestamp(match.get('fixture', {}).get('timestamp', 0))
-            match_time = match_datetime.time()
+        seasons = ref.get()
+        if not seasons:
+            return matches
             
-            if start_time <= match_time <= end_time:
-                filtered_matches.append(match)
-                
-        return filtered_matches
+        for season_data in seasons.values():
+            for league_data in season_data.values():
+                if 'fixtures' in league_data:
+                    for match in league_data['fixtures'].values():
+                        match_timestamp = match.get('metadata', {}).get('timestamp', 0)
+                        match_datetime = datetime.fromtimestamp(match_timestamp)
+                        match_time = match_datetime.time()
+                        
+                        if start_time <= match_time <= end_time:
+                            matches.append(match)
+        return matches

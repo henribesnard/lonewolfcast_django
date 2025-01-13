@@ -4,7 +4,6 @@ from .base import BaseMetric
 class ResultMetrics:
     class HomeWinsMetric(BaseMetric):
         def calculate(self, matches: List[Dict]) -> Dict[str, Any]:
-            # Ne garder que les matchs terminés
             matches = self.filter_finished_matches(matches)
             
             if not matches:

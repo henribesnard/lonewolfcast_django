@@ -30,14 +30,19 @@ class MatchService:
         return self.get_base_ref().child(f'season_{season}')
 
     def get_league_ref(self, season, league_id):
-        """Retourne la référence pour une league dans une saison."""
+        """Retourne la référence pour une ligue dans une saison."""
         return self.get_season_ref(season).child(f'league_{league_id}')
+
+    def fetch_league_metadata(self, league_id):
+        """Récupère les métadonnées de la ligue depuis Firebase."""
+        league_ref = self.root_ref.child('leagues').child(str(league_id))
+        return league_ref.get() or {}
 
     def wait_for_rate_limit(self):
         """Gestion du rate limiting de l'API."""
         current_time = time.time()
         elapsed_time = current_time - self.last_request_time
-        
+
         if elapsed_time >= 60:
             self.request_count = 0
             self.last_request_time = current_time
@@ -56,79 +61,83 @@ class MatchService:
         self.request_count += 1
 
     def fetch_matches_by_league_season(self, league_id, season):
-        """Récupère tous les matchs d'une league pour une saison donnée."""
+        """Récupère tous les matchs d'une ligue pour une saison donnée."""
         try:
             self.wait_for_rate_limit()
             url = f"{settings.API_SPORTS_BASE_URL}/fixtures"
-            params = {
-                'league': str(league_id),
-                'season': str(season)
-            }
-            
-            print(f"\n🔄 Récupération des matchs - League {league_id}, Saison {season}")
-            
+            params = {'league': str(league_id), 'season': str(season)}
+
             response = requests.get(url, headers=self.headers, params=params)
             response.raise_for_status()
             data = response.json()
-            
+
             if 'errors' in data and data['errors']:
                 print(f"⚠️ Erreur API: {data['errors']}")
                 return None
-            
-            matches = data.get('response', [])
-            print(f"✅ {len(matches)} match(s) trouvé(s)")
-            return matches
-            
+
+            return data.get('response', [])
+
         except Exception as e:
             print(f"❌ Erreur: {str(e)}")
             return None
 
-    def fetch_single_match(self, fixture_id):
-        """Récupère un match spécifique par son ID."""
-        try:
-            self.wait_for_rate_limit()
-            url = f"{settings.API_SPORTS_BASE_URL}/fixtures"
-            params = {'id': str(fixture_id)}
-            
-            response = requests.get(url, headers=self.headers, params=params)
-            response.raise_for_status()
-            
-            data = response.json()
-            if not data.get('response'):
-                print(f"❌ Pas de données pour le match {fixture_id}")
-                return None
-                
-            print(f"✅ Données récupérées pour le match {fixture_id}")
-            return data['response'][0]
-            
-        except Exception as e:
-            print(f"❌ Erreur API match {fixture_id}: {str(e)}")
-            return None
+    def save_metadata_league_and_season(self, league_id, season):
+        """Sauvegarde les métadonnées de la ligue et de la saison."""
+        league_metadata = self.fetch_league_metadata(league_id)
+        if not league_metadata:
+            print(f"⚠️ Métadonnées non trouvées pour la ligue {league_id}")
+            return False
 
-    def process_match_data(self, match_data, season):
+        league_ref = self.get_league_ref(season, league_id)
+
+        # Sauvegarder les métadonnées de la ligue
+        league_ref.child('metadata_league').set({
+            'id': league_metadata.get('league', {}).get('id'),
+            'name': league_metadata.get('league', {}).get('name'),
+            'country': league_metadata.get('country', {}).get('name'),
+            'logo': league_metadata.get('league', {}).get('logo'),
+            'type': league_metadata.get('league', {}).get('type'),
+            'updated_at': league_metadata.get('updated_at')
+        })
+
+        # Récupérer les métadonnées de la saison
+        seasons_metadata = league_metadata.get('seasons', [])
+        season_metadata = next(
+            (s for s in seasons_metadata if s.get('year') == season),
+            None
+        )
+
+        if season_metadata:
+            league_ref.child('metadata_season').set({
+                'start': season_metadata.get('start'),
+                'end': season_metadata.get('end'),
+                'year': season_metadata.get('year'),
+                'current': season_metadata.get('current'),
+                'updated_at': season_metadata.get('updated_at')
+            })
+        return True
+
+    def process_match_data(self, match_data):
         """Traite les données d'un match pour la sauvegarde."""
         fixture_data = match_data['fixture']
         return {
             'metadata': {
                 'fixture_id': fixture_data['id'],
-                'league_id': match_data['league']['id'],
-                'season': season,
-                'status': fixture_data['status']['short'],
-                'timestamp': fixture_data.get('timestamp'),
                 'date': fixture_data.get('date'),
+                'status': fixture_data['status']['short'],
                 'updated_at': datetime.now().isoformat()
             },
-            'fixture': fixture_data,
-            'league': match_data['league'],
-            'teams': match_data['teams'],
+            'fixture': {
+                'referee': fixture_data.get('referee'),
+                'venue': fixture_data.get('venue', {})
+            },
+            'teams': match_data.get('teams', {}),
             'goals': match_data.get('goals', {'home': None, 'away': None}),
-            'score': match_data.get('score', {}),
-            'events': match_data.get('events', []),
-            'statistics': match_data.get('statistics', [])
+            'score': match_data.get('score', {})
         }
 
-    def save_matches_batch(self, matches, current_season, league_id):
-        """Sauvegarde un lot de matchs pour une saison et league spécifiques."""
+    def save_matches_batch(self, matches, season, league_id):
+        """Sauvegarde un lot de matchs pour une saison et ligue spécifiques."""
         if not matches:
             return False
 
@@ -136,12 +145,12 @@ class MatchService:
             fixtures_updates = {}
             for match in matches:
                 fixture_id = match['fixture']['id']
-                processed_match = self.process_match_data(match, current_season)
+                processed_match = self.process_match_data(match)
                 fixtures_updates[f'fixture_{fixture_id}'] = processed_match
 
-            league_ref = self.get_league_ref(current_season, league_id)
+            league_ref = self.get_league_ref(season, league_id).child('fixtures')
             league_ref.update(fixtures_updates)
-            print(f"💾 {len(fixtures_updates)} match(s) sauvegardé(s) pour league {league_id}, saison {current_season}")
+            print(f"💾 {len(fixtures_updates)} match(s) sauvegardé(s) pour league {league_id}, saison {season}")
             return True
 
         except Exception as e:
@@ -149,79 +158,21 @@ class MatchService:
             return False
 
     def sync_all_matches(self):
-        """Synchronise tous les matchs pour toutes les leagues et saisons."""
-        total_matches = 0
-        start_time = time.time()
+        """Synchronise tous les matchs pour toutes les ligues et saisons."""
+        total_matches = 0  # Initialiser le compteur global
+        print("🔄 Début de la synchronisation...\n")
 
-        for league_id in self.leagues:
-            for season in self.seasons:
+        for season in self.seasons:
+            for league_id in self.leagues:
+                if not self.save_metadata_league_and_season(league_id, season):
+                    continue
                 matches = self.fetch_matches_by_league_season(league_id, season)
                 if matches:
                     if self.save_matches_batch(matches, season, league_id):
                         total_matches += len(matches)
 
-        elapsed_time = time.time() - start_time
-        print(f"\n📊 Résumé:")
-        print(f"✅ {total_matches} match(s) synchronisé(s)")
-        print(f"⏱️ Durée: {elapsed_time:.1f} secondes")
+        print(f"\n📊 Résumé : {total_matches} match(s) synchronisé(s)")
         return total_matches
-
-    def get_unfinished_matches(self):
-        """Récupère tous les matchs non terminés."""
-        try:
-            unfinished_matches = {}
-            
-            for season in self.seasons:
-                season_ref = self.get_season_ref(season)
-                season_data = season_ref.get() or {}
-                
-                for league_key, league_data in season_data.items():
-                    if not isinstance(league_data, dict):
-                        continue
-                        
-                    for fixture_key, match_data in league_data.items():
-                        if not isinstance(match_data, dict):
-                            continue
-                            
-                        status = match_data.get('metadata', {}).get('status')
-                        if status in self.ACTIVE_STATUSES:
-                            fixture_id = match_data['metadata']['fixture_id']
-                            unfinished_matches[fixture_id] = {
-                                'season': season,
-                                'league_id': match_data['metadata']['league_id'],
-                                'data': match_data
-                            }
-            
-            return unfinished_matches
-            
-        except Exception as e:
-            print(f"❌ Erreur lors de la récupération des matchs non terminés: {str(e)}")
-            return {}
-
-    def update_unfinished_matches(self):
-        """Met à jour tous les matchs non terminés."""
-        unfinished = self.get_unfinished_matches()
-        if not unfinished:
-            print("ℹ️ Aucun match à mettre à jour")
-            return 0
-
-        total = len(unfinished)
-        print(f"🔄 Mise à jour de {total} match(s)...")
-        updated = 0
-
-        for fixture_id, match_info in unfinished.items():
-            updated_data = self.fetch_single_match(fixture_id)
-            if updated_data:
-                season = match_info['season']
-                league_id = match_info['league_id']
-                if self.save_matches_batch([updated_data], season, league_id):
-                    updated += 1
-                    print(f"✅ Match {fixture_id} mis à jour")
-                else:
-                    print(f"❌ Échec de la mise à jour du match {fixture_id}")
-
-        print(f"📊 Résumé: {updated}/{total} match(s) mis à jour")
-        return updated
 
     def clear_season(self, season):
         """Supprime tous les matchs d'une saison."""
@@ -234,13 +185,13 @@ class MatchService:
             return False
 
     def clear_league(self, season, league_id):
-        """Supprime tous les matchs d'une league pour une saison donnée."""
+        """Supprime tous les matchs d'une ligue pour une saison donnée."""
         try:
             self.get_league_ref(season, league_id).delete()
             print(f"✅ League {league_id} supprimée pour la saison {season}")
             return True
         except Exception as e:
-            print(f"❌ Erreur lors de la suppression de la league {league_id}: {str(e)}")
+            print(f"❌ Erreur lors de la suppression de la ligue {league_id}: {str(e)}")
             return False
 
     def clear_all(self):

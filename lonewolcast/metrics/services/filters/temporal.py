@@ -1,6 +1,7 @@
 from datetime import datetime
 from typing import List, Dict, Any
 from .base import BaseFilter
+from firebase_admin import db
 import logging
 
 logger = logging.getLogger(__name__)
@@ -11,31 +12,38 @@ class YearFilter(BaseFilter):
     def __init__(self, year: int):
         self.year = year
 
-    def apply(self, matches: List[Dict]) -> List[Dict]:
-        unique_matches = {}  
-        
-        for match in matches:
-            try:
-                fixture_id = match['fixture']['id']
-                timestamp = match['fixture']['timestamp']
-                match_date = datetime.fromtimestamp(timestamp)
-                
-                if match_date.year == self.year:
-                    # On garde le match uniquement s'il n'existe pas déjà
-                    if fixture_id not in unique_matches:
-                        unique_matches[fixture_id] = match
-                    else:
-                        logger.warning(f"Match dupliqué ignoré - ID: {fixture_id}, Date: {match_date}")
-                        
-            except KeyError as e:
-                logger.error(f"Structure de match invalide: {e}")
-            except Exception as e:
-                logger.error(f"Erreur lors du filtrage: {e}")
+    def apply(self, matches_ref: db.Reference) -> List[Dict]:
+        matches = []
+        try:
+            seasons_data = matches_ref.get(etag=False)
+            if not seasons_data:
+                return matches
 
-        filtered_matches = list(unique_matches.values())
-        logger.info(f"YearFilter: {len(matches)} matchs -> {len(filtered_matches)} matchs uniques pour {self.year}")
-        return filtered_matches
+            for season_data in seasons_data.values():
+                for league_data in season_data.values():
+                    if not isinstance(league_data, dict) or 'fixtures' not in league_data:
+                        continue
 
+                    for fixture in league_data['fixtures'].values():
+                        try:
+                            metadata = fixture.get('metadata', {})
+                            date_str = metadata.get('date')
+                            if not date_str:
+                                continue
+
+                            match_date = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+                            if match_date.year == self.year:
+                                matches.append(fixture)
+                        except Exception as e:
+                            logger.error(f"Erreur lors du traitement d'un match: {e}")
+                            continue
+
+            logger.info(f"YearFilter: {len(matches)} matchs trouvés pour l'année {self.year}")
+            return matches
+
+        except Exception as e:
+            logger.error(f"Erreur lors du filtrage par année: {e}")
+            return matches
 
 class MonthFilter(BaseFilter):
     """Filtre les matchs par mois d'une année."""
@@ -44,27 +52,35 @@ class MonthFilter(BaseFilter):
         self.year = year
         self.month = month
 
-    def apply(self, matches: List[Dict]) -> List[Dict]:
-        unique_matches = {}  # Utilisation d'un dict pour éviter les doublons
-        
-        for match in matches:
-            try:
-                fixture_id = match['fixture']['id']
-                timestamp = match['fixture']['timestamp']
-                match_date = datetime.fromtimestamp(timestamp)
-                
-                if (match_date.year == self.year and match_date.month == self.month):
-                    # On garde le match uniquement s'il n'existe pas déjà
-                    if fixture_id not in unique_matches:
-                        unique_matches[fixture_id] = match
-                    else:
-                        logger.warning(f"Match dupliqué ignoré - ID: {fixture_id}, Date: {match_date}")
-                        
-            except KeyError as e:
-                logger.error(f"Structure de match invalide: {e}")
-            except Exception as e:
-                logger.error(f"Erreur lors du filtrage: {e}")
+    def apply(self, matches_ref: db.Reference) -> List[Dict]:
+        matches = []
+        try:
+            seasons_data = matches_ref.get(etag=False)
+            if not seasons_data:
+                return matches
 
-        filtered_matches = list(unique_matches.values())
-        logger.info(f"MonthFilter: {len(matches)} matchs -> {len(filtered_matches)} matchs uniques pour {self.month}/{self.year}")
-        return filtered_matches
+            for season_data in seasons_data.values():
+                for league_data in season_data.values():
+                    if not isinstance(league_data, dict) or 'fixtures' not in league_data:
+                        continue
+
+                    for fixture in league_data['fixtures'].values():
+                        try:
+                            metadata = fixture.get('metadata', {})
+                            date_str = metadata.get('date')
+                            if not date_str:
+                                continue
+
+                            match_date = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+                            if match_date.year == self.year and match_date.month == self.month:
+                                matches.append(fixture)
+                        except Exception as e:
+                            logger.error(f"Erreur lors du traitement d'un match: {e}")
+                            continue
+
+            logger.info(f"MonthFilter: {len(matches)} matchs trouvés pour {self.month}/{self.year}")
+            return matches
+
+        except Exception as e:
+            logger.error(f"Erreur lors du filtrage par mois: {e}")
+            return matches
