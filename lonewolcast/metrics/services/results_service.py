@@ -1,24 +1,209 @@
-from typing import Dict, Any, List
-from .filters.factory import FilterFactory
-from .metrics.results import ResultMetrics
-from .metrics.base import BaseMetric
-from .filters.team import TeamFilter, TeamLocation
+from typing import Dict, Any, List, Optional
 from datetime import datetime
 import logging
 from firebase_admin import db
+from .filters.factory import FilterFactory
+from .h2h_service import H2HService
 
 logger = logging.getLogger(__name__)
 
 class ResultsService:
-    def __init__(self):
-        self.metrics = {
-            'home_wins': ResultMetrics.HomeWinsMetric(),
-            'away_wins': ResultMetrics.AwayWinsMetric(),
-            'draws': ResultMetrics.DrawsMetric()
-        }
-        self.matches_ref = db.reference('matches')
+    """Service pour le calcul des métriques de résultats des matchs."""
 
-    def get_league_info(self, league_id: int) -> Dict[str, Any]:
+    FINISHED_STATUSES = {'FT', 'AET', 'PEN'}
+
+    def __init__(self):
+        self.matches_ref = db.reference('matches')
+        self.h2h_service = H2HService()
+
+    def get_results(self, **params) -> Dict[str, Any]:
+        """
+        Calcule les métriques de résultats selon les paramètres fournis.
+        
+        Args:
+            **params: Paramètres de filtrage (league_id, team_id, team1_id, team2_id, etc.)
+            
+        Returns:
+            Dict[str, Any]: Résultats des métriques et métadonnées
+        """
+        try:
+            logger.info(f"Calcul des métriques de résultats avec paramètres: {params}")
+
+            # Si H2H demandé, déléguer au H2HService
+            if params.get('team1_id') and params.get('team2_id'):
+                return self.h2h_service.get_results_stats(**params)
+
+            # Récupération et filtrage des matchs
+            filter_instance = FilterFactory.create_filter(**params)
+            matches = filter_instance.apply(self.matches_ref)
+            filtered_matches = self._filter_finished_matches(matches)
+            logger.info(f"Matches terminés: {len(filtered_matches)}")
+
+            if not filtered_matches:
+                return self._build_empty_response(params)
+
+            # Construction de la réponse selon le type
+            if params.get('team_id'):
+                results = self._build_team_response(filtered_matches, int(params['team_id']))
+            else:
+                results = self._build_league_response(filtered_matches)
+
+            results['metadata'] = self._build_metadata(filtered_matches, params)
+            return results
+
+        except Exception as e:
+            logger.error(f"Erreur lors du calcul des métriques: {str(e)}", exc_info=True)
+            raise
+
+    def _filter_finished_matches(self, matches: List[Dict]) -> List[Dict]:
+        """Filtre pour ne garder que les matchs terminés."""
+        return [
+            match for match in matches
+            if match.get('metadata', {}).get('status') in self.FINISHED_STATUSES
+        ]
+
+    def _build_team_response(self, matches: List[Dict], team_id: int) -> Dict[str, Any]:
+        """Construit les statistiques pour une équipe."""
+        home_matches = [m for m in matches if m['teams']['home']['id'] == team_id]
+        away_matches = [m for m in matches if m['teams']['away']['id'] == team_id]
+
+        return {
+            "total": self._calculate_aggregate_stats(home_matches + away_matches, team_id),
+            "home": self._calculate_position_stats(home_matches, True),
+            "away": self._calculate_position_stats(away_matches, False)
+        }
+
+    def _build_league_response(self, matches: List[Dict]) -> Dict[str, Any]:
+        """Construit les statistiques globales pour une ligue."""
+        total_matches = len(matches)
+        if total_matches == 0:
+            return {"total_matches": 0}
+
+        home_wins = sum(1 for m in matches 
+                       if m['score']['fulltime']['home'] > m['score']['fulltime']['away'])
+        away_wins = sum(1 for m in matches 
+                       if m['score']['fulltime']['home'] < m['score']['fulltime']['away'])
+        draws = sum(1 for m in matches 
+                   if m['score']['fulltime']['home'] == m['score']['fulltime']['away'])
+
+        return {
+            "total_matches": total_matches,
+            "results": {
+                "home_wins": {
+                    "count": home_wins,
+                    "percentage": round(home_wins / total_matches * 100, 2)
+                },
+                "away_wins": {
+                    "count": away_wins,
+                    "percentage": round(away_wins / total_matches * 100, 2)
+                },
+                "draws": {
+                    "count": draws,
+                    "percentage": round(draws / total_matches * 100, 2)
+                }
+            }
+        }
+
+    def _calculate_aggregate_stats(self, matches: List[Dict], team_id: int) -> Dict[str, Any]:
+        """Calcule les statistiques agrégées pour une équipe."""
+        total_matches = len(matches)
+        if total_matches == 0:
+            return self._get_empty_position_stats()
+
+        wins = 0
+        draws = 0
+        losses = 0
+        goals_for = 0
+        goals_against = 0
+
+        for match in matches:
+            is_home = match['teams']['home']['id'] == team_id
+            team_score = match['score']['fulltime']['home' if is_home else 'away']
+            opp_score = match['score']['fulltime']['away' if is_home else 'home']
+
+            goals_for += team_score
+            goals_against += opp_score
+
+            if team_score > opp_score:
+                wins += 1
+            elif team_score == opp_score:
+                draws += 1
+            else:
+                losses += 1
+
+        points = (wins * 3) + draws
+
+        return {
+            "matches": total_matches,
+            "wins": wins,
+            "draws": draws,
+            "losses": losses,
+            "goals_for": goals_for,
+            "goals_against": goals_against,
+            "points": points,
+            "win_percentage": round(wins / total_matches * 100, 2),
+            "points_per_game": round(points / total_matches, 2)
+        }
+
+    def _calculate_position_stats(self, matches: List[Dict], is_home: bool) -> Dict[str, Any]:
+        """Calcule les statistiques pour une position spécifique."""
+        total_matches = len(matches)
+        if total_matches == 0:
+            return self._get_empty_position_stats()
+
+        wins = 0
+        draws = 0
+        losses = 0
+        goals_for = 0
+        goals_against = 0
+
+        for match in matches:
+            team_score = match['score']['fulltime']['home' if is_home else 'away']
+            opp_score = match['score']['fulltime']['away' if is_home else 'home']
+
+            goals_for += team_score
+            goals_against += opp_score
+
+            if team_score > opp_score:
+                wins += 1
+            elif team_score == opp_score:
+                draws += 1
+            else:
+                losses += 1
+
+        points = (wins * 3) + draws
+
+        return {
+            "matches": total_matches,
+            "wins": wins,
+            "draws": draws,
+            "losses": losses,
+            "goals_for": goals_for,
+            "goals_against": goals_against,
+            "points": points,
+            "win_percentage": round(wins / total_matches * 100, 2),
+            "points_per_game": round(points / total_matches, 2)
+        }
+
+    def _build_metadata(self, matches: List[Dict], params: Dict[str, Any]) -> Dict[str, Any]:
+        """Construit les métadonnées de la réponse."""
+        metadata = {
+            'total_matches': len(matches),
+            'filters': {
+                'applied': list(params.keys()),
+                'values': {k: str(v) for k, v in params.items()},
+                'description': FilterFactory.get_filter_description(**params)
+            },
+            'period': self._get_period_info(matches)
+        }
+
+        if params.get('league_id'):
+            metadata['league'] = self._get_league_info(params['league_id'])
+
+        return metadata
+
+    def _get_league_info(self, league_id: int) -> Dict[str, Any]:
+        """Récupère les informations d'une ligue."""
         try:
             seasons = self.matches_ref.get(etag=False)
             if not seasons:
@@ -40,26 +225,8 @@ class ResultsService:
             logger.error(f"Erreur lors de la récupération des infos de la ligue: {e}")
             return {}
 
-    def sort_matches_by_date(self, matches: List[Dict], reverse: bool = True) -> List[Dict]:
-        try:
-            return sorted(
-                matches,
-                key=lambda m: datetime.fromisoformat(
-                    m.get('metadata', {}).get('date', '').replace("Z", "+00:00")
-                ),
-                reverse=reverse
-            )
-        except Exception as e:
-            logger.error(f"Erreur lors du tri des matchs: {e}")
-            return matches
-
-    def filter_finished_matches(self, matches: List[Dict]) -> List[Dict]:
-        return [
-            match for match in matches
-            if match.get('metadata', {}).get('status') in BaseMetric.FINISHED_STATUSES
-        ]
-
     def _get_period_info(self, matches: List[Dict]) -> Dict[str, Any]:
+        """Calcule les informations de période pour les matchs."""
         if not matches:
             return {
                 "start": None,
@@ -103,113 +270,37 @@ class ResultsService:
                 "end_formatted": None
             }
 
-    def get_results(self, **params) -> Dict[str, Any]:
-        try:
-            logger.info(f"Calcul des métriques avec paramètres: {params}")
+    def _get_empty_position_stats(self) -> Dict[str, Any]:
+        """Retourne des statistiques vides pour une position."""
+        return {
+            "matches": 0,
+            "wins": 0,
+            "draws": 0,
+            "losses": 0,
+            "goals_for": 0,
+            "goals_against": 0,
+            "points": 0,
+            "win_percentage": 0,
+            "points_per_game": 0
+        }
 
-            if not params.get('league_id') and not params.get('team_id'):
-                raise ValueError("Au moins league_id ou team_id doit être spécifié")
-
-            matches = []
-
-            # Étape 1: Filtres principaux (league_id et season)
-            main_params = {
-                k: v for k, v in params.items() 
-                if k in ['league_id', 'season']
-            }
-            if main_params:
-                league_filter = FilterFactory.create_league_scope(**main_params)
-                matches = league_filter.apply(self.matches_ref)
-                logger.info(f"Matches après filtres principaux: {len(matches)}")
-
-            # Étape 2: Filtre d'équipe
-            if params.get('team_id'):
-                location = params.get('location', TeamLocation.ALL)
-                team_filter = TeamFilter(params['team_id'], location)
-                
-                if matches:
-                    filtered_matches = [
-                        match for match in matches if team_filter._check_team_position(match)
-                    ]
-                    matches = filtered_matches
-                else:
-                    matches = team_filter.apply(self.matches_ref)
-                
-                logger.info(f"Matches après filtre équipe: {len(matches)}")
-
-            # Étape 3: Filtres temporels
-            if params.get('year'):
-                year = int(params['year'])
-                filtered_matches = []
-                for match in matches:
-                    try:
-                        date_str = match.get('metadata', {}).get('date', '')
-                        if date_str:
-                            match_date = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
-                            if match_date.year == year:
-                                if params.get('month') and match_date.month == int(params['month']):
-                                    filtered_matches.append(match)
-                                elif not params.get('month'):
-                                    filtered_matches.append(match)
-                    except Exception as e:
-                        logger.error(f"Erreur lors du filtrage temporel d'un match: {e}")
-                        continue
-
-                matches = filtered_matches
-                logger.info(f"Matches après filtres temporels: {len(matches)}")
-
-            # Étape 4: Autres filtres
-            other_params = {
-                k: v for k, v in params.items() 
-                if k in ['game_time', 'weekday']
-            }
-            if other_params:
-                other_filter = FilterFactory.create_league_scope(**other_params)
-                other_matches = other_filter.apply(self.matches_ref)
-                matches = [m for m in matches if any(
-                    om['metadata']['fixture_id'] == m['metadata']['fixture_id']
-                    for om in other_matches
-                )]
-                logger.info(f"Matches après autres filtres: {len(matches)}")
-
-            # Étape 5: Filtres de séquence
-            if params.get('last_matches'):
-                matches = self.sort_matches_by_date(matches, reverse=True)[:params['last_matches']]
-                logger.info(f"Matches après last_matches: {len(matches)}")
-            elif params.get('first_matches'):
-                matches = self.sort_matches_by_date(matches, reverse=False)[:params['first_matches']]
-                logger.info(f"Matches après first_matches: {len(matches)}")
-
-            # Étape 6: Filtrage des matchs terminés
-            finished_matches = self.filter_finished_matches(matches)
-            logger.info(f"Matches terminés: {len(finished_matches)}")
-
-            # Étape 7: Calcul des métriques
-            results = {}
-            for name, metric in self.metrics.items():
-                results[name] = metric.calculate(finished_matches)
-                logger.info(f"Métrique {name}: {results[name]}")
-
+    def _build_empty_response(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Construit une réponse vide."""
+        if params.get('team_id'):
             response = {
-                **results,
-                'metadata': {
-                    'total_matches': len(finished_matches),
-                    'filters': {
-                        'applied': list(params.keys()),
-                        'values': {k: str(v) for k, v in params.items()}
-                    },
-                    'period': self._get_period_info(finished_matches)
+                "total": self._get_empty_position_stats(),
+                "home": self._get_empty_position_stats(),
+                "away": self._get_empty_position_stats()
+            }
+        else:
+            response = {
+                "total_matches": 0,
+                "results": {
+                    "home_wins": {"count": 0, "percentage": 0},
+                    "away_wins": {"count": 0, "percentage": 0},
+                    "draws": {"count": 0, "percentage": 0}
                 }
             }
 
-            if params.get('league_id'):
-                response['metadata']['league'] = self.get_league_info(params['league_id'])
-
-            return response
-
-        except ValueError as e:
-            logger.error(f"Erreur de validation: {str(e)}")
-            return {"error": str(e)}
-        except Exception as e:
-            logger.error(f"Erreur lors du calcul des métriques: {str(e)}", exc_info=True)
-            raise
+        response['metadata'] = self._build_metadata([], params)
+        return response
