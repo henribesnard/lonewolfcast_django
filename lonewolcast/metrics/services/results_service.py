@@ -19,12 +19,6 @@ class ResultsService:
     def get_results(self, **params) -> Dict[str, Any]:
         """
         Calcule les métriques de résultats selon les paramètres fournis.
-        
-        Args:
-            **params: Paramètres de filtrage (league_id, team_id, team1_id, team2_id, etc.)
-            
-        Returns:
-            Dict[str, Any]: Résultats des métriques et métadonnées
         """
         try:
             logger.info(f"Calcul des métriques de résultats avec paramètres: {params}")
@@ -37,23 +31,43 @@ class ResultsService:
             filter_instance = FilterFactory.create_filter(**params)
             matches = filter_instance.apply(self.matches_ref)
             filtered_matches = self._filter_finished_matches(matches)
-            logger.info(f"Matches terminés: {len(filtered_matches)}")
 
-            if not filtered_matches:
+            # Tri et limitation des matchs si nécessaire
+            final_matches = self._apply_sequence_filter(filtered_matches, params)
+            logger.info(f"Matches après filtrage complet: {len(final_matches)}")
+
+            if not final_matches:
                 return self._build_empty_response(params)
 
             # Construction de la réponse selon le type
             if params.get('team_id'):
-                results = self._build_team_response(filtered_matches, int(params['team_id']))
+                results = self._build_team_response(final_matches, int(params['team_id']))
             else:
-                results = self._build_league_response(filtered_matches)
+                results = self._build_league_response(final_matches)
 
-            results['metadata'] = self._build_metadata(filtered_matches, params)
+            results['metadata'] = self._build_metadata(final_matches, params)
             return results
 
         except Exception as e:
             logger.error(f"Erreur lors du calcul des métriques: {str(e)}", exc_info=True)
             raise
+
+    def _apply_sequence_filter(self, matches: List[Dict], params: Dict[str, Any]) -> List[Dict]:
+        """Applique les filtres de séquence (last_matches/first_matches)."""
+        sorted_matches = sorted(
+            matches,
+            key=lambda m: datetime.fromisoformat(
+                m.get('metadata', {}).get('date', '').replace("Z", "+00:00")
+            ),
+            reverse=True  # Du plus récent au plus ancien
+        )
+
+        if params.get('last_matches'):
+            return sorted_matches[:int(params['last_matches'])]
+        elif params.get('first_matches'):
+            return sorted_matches[-int(params['first_matches']):]
+
+        return sorted_matches
 
     def _filter_finished_matches(self, matches: List[Dict]) -> List[Dict]:
         """Filtre pour ne garder que les matchs terminés."""
@@ -181,14 +195,24 @@ class ResultsService:
             "goals_for": goals_for,
             "goals_against": goals_against,
             "points": points,
-            "win_percentage": round(wins / total_matches * 100, 2),
-            "points_per_game": round(points / total_matches, 2)
+            "win_percentage": round(wins / total_matches * 100, 2) if total_matches > 0 else 0,
+            "points_per_game": round(points / total_matches, 2) if total_matches > 0 else 0
         }
 
     def _build_metadata(self, matches: List[Dict], params: Dict[str, Any]) -> Dict[str, Any]:
         """Construit les métadonnées de la réponse."""
+        # Pour une équipe spécifique, utiliser le nombre de matchs des stats détaillées
+        if params.get('team_id'):
+            total_matches = len([m for m in matches 
+                               if int(params['team_id']) in [
+                                   m['teams']['home']['id'],
+                                   m['teams']['away']['id']
+                               ]])
+        else:
+            total_matches = len(matches)
+
         metadata = {
-            'total_matches': len(matches),
+            'total_matches': total_matches,
             'filters': {
                 'applied': list(params.keys()),
                 'values': {k: str(v) for k, v in params.items()},

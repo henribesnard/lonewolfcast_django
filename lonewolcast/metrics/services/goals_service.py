@@ -34,18 +34,21 @@ class GoalsService(ResultsService):
             filter_instance = FilterFactory.create_filter(**params)
             matches = filter_instance.apply(self.matches_ref)
             filtered_matches = self._filter_finished_matches(matches)
-            logger.info(f"Matches terminés: {len(filtered_matches)}")
+            
+            # Application du filtre de séquence
+            final_matches = self._apply_sequence_filter(filtered_matches, params)
+            logger.info(f"Matches après filtrage complet: {len(final_matches)}")
 
-            if not filtered_matches:
+            if not final_matches:
                 return self._build_empty_response(params)
 
             # Construction de la réponse selon le type
             if params.get('team_id'):
-                results = self._build_team_response(filtered_matches, int(params['team_id']))
+                results = self._build_team_response(final_matches, int(params['team_id']))
             else:
-                results = self._build_league_response(filtered_matches)
+                results = self._build_league_response(final_matches)
 
-            results['metadata'] = self._build_metadata(filtered_matches, params)
+            results['metadata'] = self._build_metadata(final_matches, params)
             return results
 
         except Exception as e:
@@ -56,12 +59,13 @@ class GoalsService(ResultsService):
         """Construit les statistiques de buts pour une équipe."""
         home_matches = [m for m in matches if m['teams']['home']['id'] == team_id]
         away_matches = [m for m in matches if m['teams']['away']['id'] == team_id]
+        team_matches = home_matches + away_matches
 
         return {
-            "total": self._calculate_team_stats(home_matches + away_matches),
-            "home": self._calculate_position_stats(home_matches, True),
-            "away": self._calculate_position_stats(away_matches, False),
-            "thresholds": self._calculate_thresholds(home_matches + away_matches)
+            "total": self._calculate_team_stats(team_matches, team_id),
+            "home": self._calculate_position_stats(home_matches, True, team_id),
+            "away": self._calculate_position_stats(away_matches, False, team_id),
+            "thresholds": self._calculate_thresholds(team_matches)
         }
 
     def _build_league_response(self, matches: List[Dict]) -> Dict[str, Any]:
@@ -95,25 +99,38 @@ class GoalsService(ResultsService):
             "thresholds": self._calculate_thresholds(matches)
         }
 
-    def _calculate_team_stats(self, matches: List[Dict]) -> Dict[str, Any]:
+    def _calculate_team_stats(self, matches: List[Dict], team_id: int) -> Dict[str, Any]:
         """Calcule les statistiques globales de buts pour une équipe."""
         total_matches = len(matches)
         if total_matches == 0:
             return self._get_empty_team_stats()
 
-        goals_scored = sum(match['score']['fulltime']['home'] for match in matches)
-        goals_conceded = sum(match['score']['fulltime']['away'] for match in matches)
-        clean_sheets = sum(1 for m in matches if m['score']['fulltime']['away'] == 0)
-        failed_to_score = sum(1 for m in matches if m['score']['fulltime']['home'] == 0)
-        btts = sum(1 for m in matches 
-                  if m['score']['fulltime']['home'] > 0 
-                  and m['score']['fulltime']['away'] > 0)
+        total_goals_scored = 0
+        total_goals_conceded = 0
+        clean_sheets = 0
+        failed_to_score = 0
+        btts = 0
+
+        for match in matches:
+            is_home = 'home' if match['teams']['home']['id'] == team_id else 'away'
+            goals_scored = match['score']['fulltime'][is_home]
+            goals_conceded = match['score']['fulltime']['away' if is_home == 'home' else 'home']
+            
+            total_goals_scored += goals_scored
+            total_goals_conceded += goals_conceded
+            
+            if goals_conceded == 0:
+                clean_sheets += 1
+            if goals_scored == 0:
+                failed_to_score += 1
+            if goals_scored > 0 and goals_conceded > 0:
+                btts += 1
 
         return {
             "matches": total_matches,
-            "goals_scored": goals_scored,
-            "goals_conceded": goals_conceded,
-            "goals_per_game": round(goals_scored / total_matches, 2),
+            "goals_scored": total_goals_scored,
+            "goals_conceded": total_goals_conceded,
+            "goals_per_game": round(total_goals_scored / total_matches, 2),
             "clean_sheets": clean_sheets,
             "clean_sheets_percentage": round(clean_sheets / total_matches * 100, 2),
             "failed_to_score": failed_to_score,
@@ -122,23 +139,20 @@ class GoalsService(ResultsService):
             "btts_percentage": round(btts / total_matches * 100, 2)
         }
 
-    def _calculate_position_stats(self, matches: List[Dict], is_home: bool) -> Dict[str, Any]:
+    def _calculate_position_stats(self, matches: List[Dict], is_home: bool, team_id: int) -> Dict[str, Any]:
         """Calcule les statistiques de buts pour une position spécifique."""
         total_matches = len(matches)
         if total_matches == 0:
             return self._get_empty_position_stats()
 
-        goals_scored = sum(m['score']['fulltime']['home' if is_home else 'away'] 
-                          for m in matches)
-        goals_conceded = sum(m['score']['fulltime']['away' if is_home else 'home'] 
-                            for m in matches)
+        goals_scored = sum(m['score']['fulltime']['home' if is_home else 'away'] for m in matches)
+        goals_conceded = sum(m['score']['fulltime']['away' if is_home else 'home'] for m in matches)
         clean_sheets = sum(1 for m in matches 
                           if m['score']['fulltime']['away' if is_home else 'home'] == 0)
         failed_to_score = sum(1 for m in matches 
                             if m['score']['fulltime']['home' if is_home else 'away'] == 0)
         btts = sum(1 for m in matches 
-                  if m['score']['fulltime']['home'] > 0 
-                  and m['score']['fulltime']['away'] > 0)
+                  if m['score']['fulltime']['home'] > 0 and m['score']['fulltime']['away'] > 0)
 
         return {
             "matches": total_matches,
@@ -201,11 +215,29 @@ class GoalsService(ResultsService):
 
     def _build_empty_response(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Construit une réponse vide."""
-        response = {
-            "total": self._get_empty_team_stats(),
-            "home": self._get_empty_position_stats(),
-            "away": self._get_empty_position_stats(),
-            "thresholds": {}
-        }
+        if params.get('team_id'):
+            response = {
+                "total": self._get_empty_team_stats(),
+                "home": self._get_empty_position_stats(),
+                "away": self._get_empty_position_stats(),
+                "thresholds": {}
+            }
+        else:
+            response = {
+                "goals": {
+                    "total": 0,
+                    "average": 0
+                },
+                "btts": {
+                    "matches": 0,
+                    "percentage": 0
+                },
+                "clean_sheets": {
+                    "matches": 0,
+                    "percentage": 0
+                },
+                "thresholds": {}
+            }
+
         response['metadata'] = self._build_metadata([], params)
         return response
