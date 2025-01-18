@@ -2,7 +2,7 @@ from typing import Dict, Any, List, Optional
 from datetime import datetime
 import logging
 from firebase_admin import db
-from .filters.factory import FilterFactory
+from .filters.h2h import H2HLocation
 
 logger = logging.getLogger(__name__)
 
@@ -15,16 +15,11 @@ class H2HService:
         self.matches_ref = db.reference('matches')
 
     def get_results_stats(self, **params) -> Dict[str, Any]:
-        """
-        Récupère les statistiques complètes de résultats H2H.
-        
-        Args:
-            team1_id: ID de la première équipe
-            team2_id: ID de la deuxième équipe
-            **params: Autres paramètres de filtrage
-        """
+        """Récupère les statistiques complètes de résultats H2H."""
         try:
+            logger.info(f"Calcul des statistiques H2H (résultats) avec paramètres: {params}")
             matches = self._get_h2h_matches(params)
+            
             if not matches:
                 return self._build_empty_response('results', params)
 
@@ -35,16 +30,11 @@ class H2HService:
             raise
 
     def get_goals_stats(self, **params) -> Dict[str, Any]:
-        """
-        Récupère les statistiques complètes de buts H2H.
-        
-        Args:
-            team1_id: ID de la première équipe
-            team2_id: ID de la deuxième équipe
-            **params: Autres paramètres de filtrage
-        """
+        """Récupère les statistiques complètes de buts H2H."""
         try:
+            logger.info(f"Calcul des statistiques H2H (buts) avec paramètres: {params}")
             matches = self._get_h2h_matches(params)
+            
             if not matches:
                 return self._build_empty_response('goals', params)
 
@@ -56,27 +46,63 @@ class H2HService:
 
     def _get_h2h_matches(self, params: Dict[str, Any]) -> List[Dict]:
         """Récupère les matchs H2H filtrés."""
-        filter_instance = FilterFactory.create_filter(**params)
-        matches = filter_instance.apply(self.matches_ref)
-        
-        # Filtrer les matchs H2H
-        h2h_matches = [
-            m for m in matches
-            if self._is_h2h_match(m, int(params['team1_id']), int(params['team2_id']))
-            and m.get('metadata', {}).get('status') in self.FINISHED_STATUSES
-        ]
+        try:
+            team1_id = int(params['team1_id'])
+            team2_id = int(params['team2_id'])
+            h2h_location = params.get('h2h_location')
 
-        logger.info(f"Matchs H2H trouvés: {len(h2h_matches)}")
-        return h2h_matches
+            # Convertir la chaîne en enum si nécessaire
+            if isinstance(h2h_location, str):
+                try:
+                    location = H2HLocation[h2h_location]
+                except KeyError:
+                    location = H2HLocation.ANY
+            elif h2h_location is None:
+                location = H2HLocation.ANY
+            else:
+                location = h2h_location
 
-    def _is_h2h_match(self, match: Dict, team1_id: int, team2_id: int) -> bool:
-        """Vérifie si un match est une confrontation directe."""
-        home_id = match['teams']['home']['id']
-        away_id = match['teams']['away']['id']
-        return (
-            (home_id == team1_id and away_id == team2_id) or
-            (home_id == team2_id and away_id == team1_id)
-        )
+            logger.info(f"Récupération des matchs H2H entre {team1_id} et {team2_id} avec location: {location.value}")
+
+            # Récupérer tous les matchs
+            matches = []
+            seasons_data = self.matches_ref.get(etag=False) or {}
+            
+            for season_data in seasons_data.values():
+                for league_data in season_data.values():
+                    if not isinstance(league_data, dict) or 'fixtures' not in league_data:
+                        continue
+
+                    for match in league_data['fixtures'].values():
+                        if match.get('metadata', {}).get('status') not in self.FINISHED_STATUSES:
+                            continue
+
+                        home_id = match['teams']['home']['id']
+                        away_id = match['teams']['away']['id']
+
+                        # Vérifier la configuration selon l'enum
+                        if location == H2HLocation.TEAM1_HOME:
+                            if not (home_id == team1_id and away_id == team2_id):
+                                continue
+                        elif location == H2HLocation.TEAM1_AWAY:
+                            if not (home_id == team2_id and away_id == team1_id):
+                                continue
+                        else:  # H2HLocation.ANY
+                            if not ((home_id == team1_id and away_id == team2_id) or
+                                   (home_id == team2_id and away_id == team1_id)):
+                                continue
+
+                        matches.append(match)
+
+            matches_count = len(matches)
+            logger.info(f"Matchs H2H trouvés pour {location.value}: {matches_count}")
+            
+            # Tri chronologique
+            return sorted(matches, key=lambda m: m['metadata']['date'])
+
+        except Exception as e:
+            logger.error(f"Erreur lors de la récupération des matchs H2H: {e}")
+            return []
 
     def _build_results_response(self, matches: List[Dict], params: Dict[str, Any]) -> Dict[str, Any]:
         """Construit la réponse pour les statistiques de résultats H2H."""
@@ -105,7 +131,6 @@ class H2HService:
         team1_stats = self._calculate_team_goals_stats(matches, team1_id)
         team2_stats = self._calculate_team_goals_stats(matches, team2_id)
 
-        # Calculer les statistiques BTTS et seuils
         btts_matches = sum(1 for m in matches 
                           if m['score']['fulltime']['home'] > 0 
                           and m['score']['fulltime']['away'] > 0)
@@ -118,7 +143,7 @@ class H2HService:
                 "overall": {
                     "btts": {
                         "matches": btts_matches,
-                        "percentage": round(btts_matches / total_matches * 100, 2)
+                        "percentage": round(btts_matches / total_matches * 100, 2) if total_matches > 0 else 0
                     },
                     "thresholds": self._calculate_thresholds(matches)
                 }
@@ -128,6 +153,10 @@ class H2HService:
 
     def _calculate_team_stats(self, matches: List[Dict], team_id: int) -> Dict[str, Any]:
         """Calcule les statistiques de résultats pour une équipe."""
+        total_matches = len(matches)
+        if total_matches == 0:
+            return self._get_empty_team_stats()
+
         wins = 0
         draws = 0
         losses = 0
@@ -155,7 +184,6 @@ class H2HService:
             else:
                 losses += 1
 
-        total_matches = len(matches)
         return {
             "total": {
                 "matches": total_matches,
@@ -216,8 +244,11 @@ class H2HService:
         """Calcule les statistiques de seuils de buts."""
         thresholds = [0.5, 1.5, 2.5, 3.5, 4.5]
         total_matches = len(matches)
-        results = {}
+        
+        if total_matches == 0:
+            return {}
 
+        results = {}
         for threshold in thresholds:
             over_count = sum(
                 1 for m in matches
@@ -237,12 +268,19 @@ class H2HService:
 
     def _build_metadata(self, matches: List[Dict], params: Dict[str, Any]) -> Dict[str, Any]:
         """Construit les métadonnées."""
+        # Traiter l'enum H2HLocation correctement
+        h2h_location = params.get('h2h_location')
+        if h2h_location:
+            location_str = h2h_location.value if hasattr(h2h_location, 'value') else str(h2h_location)
+        else:
+            location_str = 'any'
+
         return {
             'total_matches': len(matches),
             'filters': {
                 'applied': list(params.keys()),
                 'values': {k: str(v) for k, v in params.items()},
-                'description': FilterFactory.get_filter_description(**params)
+                'description': f"Matchs H2H entre équipes {params['team1_id']} et {params['team2_id']} ({location_str.lower()})"
             },
             'period': self._get_period_info(matches)
         }
@@ -291,8 +329,28 @@ class H2HService:
                 "end_formatted": None
             }
 
+    def _get_empty_team_stats(self) -> Dict[str, Any]:
+        """Retourne les statistiques vides pour une équipe."""
+        return {
+            "total": {
+                "matches": 0,
+                "wins": 0,
+                "draws": 0,
+                "losses": 0,
+                "win_percentage": 0,
+                "home_wins": 0,
+                "away_wins": 0
+            },
+            "goals": {
+                "for": 0,
+                "against": 0,
+                "average_for": 0,
+                "average_against": 0
+            }
+        }
+
     def _get_empty_goals_stats(self) -> Dict[str, Any]:
-        """Retourne des statistiques de buts vides."""
+        """Retourne les statistiques de buts vides."""
         return {
             "total": {
                 "matches": 0,
@@ -312,23 +370,7 @@ class H2HService:
         if stats_type == 'goals':
             empty_stats = self._get_empty_goals_stats()
         else:
-            empty_stats = {
-                "total": {
-                    "matches": 0,
-                    "wins": 0,
-                    "draws": 0,
-                    "losses": 0,
-                    "win_percentage": 0,
-                    "home_wins": 0,
-                    "away_wins": 0
-                },
-                "goals": {
-                    "for": 0,
-                    "against": 0,
-                    "average_for": 0,
-                    "average_against": 0
-                }
-            }
+            empty_stats = self._get_empty_team_stats()
 
         return {
             "head_to_head": {
