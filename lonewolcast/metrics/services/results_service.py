@@ -27,12 +27,20 @@ class ResultsService:
             if params.get('team1_id') and params.get('team2_id'):
                 return self.h2h_service.get_results_stats(**params)
 
-            # Récupération et filtrage des matchs
+            # Récupération et filtrage initial des matchs
             filter_instance = FilterFactory.create_filter(**params)
             matches = filter_instance.apply(self.matches_ref)
             filtered_matches = self._filter_finished_matches(matches)
 
-            # Tri et limitation des matchs si nécessaire
+            # Si on a un team_id, on filtre d'abord par équipe
+            team_id = params.get('team_id')
+            if team_id:
+                team_id = int(team_id)
+                filtered_matches = [m for m in filtered_matches 
+                                 if team_id in [m['teams']['home']['id'],
+                                              m['teams']['away']['id']]]
+
+            # Ensuite on applique le filtre de séquence
             final_matches = self._apply_sequence_filter(filtered_matches, params)
             logger.info(f"Matches après filtrage complet: {len(final_matches)}")
 
@@ -40,8 +48,8 @@ class ResultsService:
                 return self._build_empty_response(params)
 
             # Construction de la réponse selon le type
-            if params.get('team_id'):
-                results = self._build_team_response(final_matches, int(params['team_id']))
+            if team_id:
+                results = self._build_team_response(final_matches, team_id)
             else:
                 results = self._build_league_response(final_matches)
 
@@ -53,19 +61,25 @@ class ResultsService:
             raise
 
     def _apply_sequence_filter(self, matches: List[Dict], params: Dict[str, Any]) -> List[Dict]:
-        """Applique les filtres de séquence (last_matches/first_matches)."""
+        """
+        Applique les filtres de séquence (last_matches/first_matches).
+        Les matchs sont d'abord triés chronologiquement.
+        """
+        # Tri chronologique
         sorted_matches = sorted(
             matches,
             key=lambda m: datetime.fromisoformat(
                 m.get('metadata', {}).get('date', '').replace("Z", "+00:00")
-            ),
-            reverse=True  # Du plus récent au plus ancien
+            )
         )
 
+        # Application des limites
         if params.get('last_matches'):
-            return sorted_matches[:int(params['last_matches'])]
+            limit = int(params['last_matches'])
+            return sorted_matches[-limit:]  # Prendre les N derniers
         elif params.get('first_matches'):
-            return sorted_matches[-int(params['first_matches']):]
+            limit = int(params['first_matches'])
+            return sorted_matches[:limit]  # Prendre les N premiers
 
         return sorted_matches
 
@@ -201,15 +215,7 @@ class ResultsService:
 
     def _build_metadata(self, matches: List[Dict], params: Dict[str, Any]) -> Dict[str, Any]:
         """Construit les métadonnées de la réponse."""
-        # Pour une équipe spécifique, utiliser le nombre de matchs des stats détaillées
-        if params.get('team_id'):
-            total_matches = len([m for m in matches 
-                               if int(params['team_id']) in [
-                                   m['teams']['home']['id'],
-                                   m['teams']['away']['id']
-                               ]])
-        else:
-            total_matches = len(matches)
+        total_matches = len(matches)
 
         metadata = {
             'total_matches': total_matches,

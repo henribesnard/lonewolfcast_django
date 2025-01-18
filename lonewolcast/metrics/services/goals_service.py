@@ -19,23 +19,28 @@ class GoalsService(ResultsService):
     def get_results(self, **params) -> Dict[str, Any]:
         """
         Calcule les métriques de buts selon les paramètres fournis.
-        
-        Args:
-            **params: Paramètres de filtrage (league_id, team_id, team1_id, team2_id, etc.)
         """
         try:
             logger.info(f"Calcul des métriques de buts avec paramètres: {params}")
 
-            # Si H2H demandé (team1_id et team2_id présents), déléguer au H2HService
+            # Si H2H demandé, déléguer au H2HService
             if params.get('team1_id') and params.get('team2_id'):
                 return self.h2h_service.get_goals_stats(**params)
 
-            # Récupération et filtrage des matchs
+            # Récupération et filtrage initial des matchs
             filter_instance = FilterFactory.create_filter(**params)
             matches = filter_instance.apply(self.matches_ref)
             filtered_matches = self._filter_finished_matches(matches)
-            
-            # Application du filtre de séquence
+
+            # Si on a un team_id, on filtre d'abord par équipe
+            team_id = params.get('team_id')
+            if team_id:
+                team_id = int(team_id)
+                filtered_matches = [m for m in filtered_matches 
+                                 if team_id in [m['teams']['home']['id'],
+                                              m['teams']['away']['id']]]
+
+            # Ensuite on applique le filtre de séquence
             final_matches = self._apply_sequence_filter(filtered_matches, params)
             logger.info(f"Matches après filtrage complet: {len(final_matches)}")
 
@@ -43,8 +48,8 @@ class GoalsService(ResultsService):
                 return self._build_empty_response(params)
 
             # Construction de la réponse selon le type
-            if params.get('team_id'):
-                results = self._build_team_response(final_matches, int(params['team_id']))
+            if team_id:
+                results = self._build_team_response(final_matches, team_id)
             else:
                 results = self._build_league_response(final_matches)
 
@@ -112,9 +117,9 @@ class GoalsService(ResultsService):
         btts = 0
 
         for match in matches:
-            is_home = 'home' if match['teams']['home']['id'] == team_id else 'away'
-            goals_scored = match['score']['fulltime'][is_home]
-            goals_conceded = match['score']['fulltime']['away' if is_home == 'home' else 'home']
+            is_home = match['teams']['home']['id'] == team_id
+            goals_scored = match['score']['fulltime']['home' if is_home else 'away']
+            goals_conceded = match['score']['fulltime']['away' if is_home else 'home']
             
             total_goals_scored += goals_scored
             total_goals_conceded += goals_conceded
