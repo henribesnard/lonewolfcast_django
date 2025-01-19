@@ -3,6 +3,7 @@ from datetime import datetime
 import logging
 from firebase_admin import db
 from .filters.h2h import H2HLocation
+from .filters.factory import FilterFactory
 
 logger = logging.getLogger(__name__)
 
@@ -64,45 +65,51 @@ class H2HService:
 
             logger.info(f"Récupération des matchs H2H entre {team1_id} et {team2_id} avec location: {location.value}")
 
-            # Récupérer tous les matchs
-            matches = []
-            seasons_data = self.matches_ref.get(etag=False) or {}
+            # Appliquer d'abord tous les filtres via FilterFactory
+            filter_params = params.copy()
+            # Retirer les paramètres H2H spécifiques pour éviter les conflits
+            filter_params.pop('team1_id', None)
+            filter_params.pop('team2_id', None)
+            filter_params.pop('h2h_location', None)
             
-            for season_data in seasons_data.values():
-                for league_data in season_data.values():
-                    if not isinstance(league_data, dict) or 'fixtures' not in league_data:
+            filter_instance = FilterFactory.create_filter(**filter_params)
+            filtered_matches = filter_instance.apply(self.matches_ref)
+            filtered_matches = self._filter_finished_matches(filtered_matches)
+
+            # Ensuite appliquer le filtre H2H avec la location
+            h2h_matches = []
+            for match in filtered_matches:
+                home_id = match['teams']['home']['id']
+                away_id = match['teams']['away']['id']
+
+                # Vérifier la configuration selon l'enum
+                if location == H2HLocation.TEAM1_HOME:
+                    if not (home_id == team1_id and away_id == team2_id):
                         continue
+                elif location == H2HLocation.TEAM1_AWAY:
+                    if not (home_id == team2_id and away_id == team1_id):
+                        continue
+                else:  # H2HLocation.ANY
+                    if not ((home_id == team1_id and away_id == team2_id) or
+                           (home_id == team2_id and away_id == team1_id)):
+                        continue
+                h2h_matches.append(match)
 
-                    for match in league_data['fixtures'].values():
-                        if match.get('metadata', {}).get('status') not in self.FINISHED_STATUSES:
-                            continue
-
-                        home_id = match['teams']['home']['id']
-                        away_id = match['teams']['away']['id']
-
-                        # Vérifier la configuration selon l'enum
-                        if location == H2HLocation.TEAM1_HOME:
-                            if not (home_id == team1_id and away_id == team2_id):
-                                continue
-                        elif location == H2HLocation.TEAM1_AWAY:
-                            if not (home_id == team2_id and away_id == team1_id):
-                                continue
-                        else:  # H2HLocation.ANY
-                            if not ((home_id == team1_id and away_id == team2_id) or
-                                   (home_id == team2_id and away_id == team1_id)):
-                                continue
-
-                        matches.append(match)
-
-            matches_count = len(matches)
-            logger.info(f"Matchs H2H trouvés pour {location.value}: {matches_count}")
-            
             # Tri chronologique
-            return sorted(matches, key=lambda m: m['metadata']['date'])
+            sorted_matches = sorted(h2h_matches, key=lambda m: m['metadata']['date'])
+            logger.info(f"Matchs H2H trouvés: {len(sorted_matches)}")
+            return sorted_matches
 
         except Exception as e:
             logger.error(f"Erreur lors de la récupération des matchs H2H: {e}")
             return []
+
+    def _filter_finished_matches(self, matches: List[Dict]) -> List[Dict]:
+        """Filtre pour ne garder que les matchs terminés."""
+        return [
+            match for match in matches
+            if match.get('metadata', {}).get('status') in self.FINISHED_STATUSES
+        ]
 
     def _build_results_response(self, matches: List[Dict], params: Dict[str, Any]) -> Dict[str, Any]:
         """Construit la réponse pour les statistiques de résultats H2H."""
@@ -117,7 +124,8 @@ class H2HService:
             "head_to_head": {
                 "total_matches": total_matches,
                 "team1_stats": team1_stats,
-                "team2_stats": team2_stats
+                "team2_stats": team2_stats,
+                "last_matches": self._get_last_matches_info(matches, team1_id)
             },
             "metadata": self._build_metadata(matches, params)
         }
@@ -146,7 +154,8 @@ class H2HService:
                         "percentage": round(btts_matches / total_matches * 100, 2) if total_matches > 0 else 0
                     },
                     "thresholds": self._calculate_thresholds(matches)
-                }
+                },
+                "last_matches": self._get_last_matches_info(matches, team1_id)
             },
             "metadata": self._build_metadata(matches, params)
         }
@@ -266,9 +275,34 @@ class H2HService:
 
         return results
 
+    def _get_last_matches_info(self, matches: List[Dict], team1_id: int, limit: int = 5) -> List[Dict]:
+        """Récupère les informations des derniers matchs."""
+        last_matches = matches[-limit:] if matches else []
+        return [
+            {
+                "date": match['metadata']['date'],
+                "home_team": {
+                    "id": match['teams']['home']['id'],
+                    "score": match['score']['fulltime']['home']
+                },
+                "away_team": {
+                    "id": match['teams']['away']['id'],
+                    "score": match['score']['fulltime']['away']
+                },
+                "winner": "team1" if (
+                    (match['teams']['home']['id'] == team1_id and 
+                     match['score']['fulltime']['home'] > match['score']['fulltime']['away']) or
+                    (match['teams']['away']['id'] == team1_id and 
+                     match['score']['fulltime']['away'] > match['score']['fulltime']['home'])
+                ) else "team2" if (
+                    match['score']['fulltime']['home'] != match['score']['fulltime']['away']
+                ) else "draw"
+            }
+            for match in last_matches
+        ]
+
     def _build_metadata(self, matches: List[Dict], params: Dict[str, Any]) -> Dict[str, Any]:
         """Construit les métadonnées."""
-        # Traiter l'enum H2HLocation correctement
         h2h_location = params.get('h2h_location')
         if h2h_location:
             location_str = h2h_location.value if hasattr(h2h_location, 'value') else str(h2h_location)
@@ -380,7 +414,8 @@ class H2HService:
                 "overall": {
                     "btts": {"matches": 0, "percentage": 0},
                     "thresholds": {}
-                } if stats_type == 'goals' else {}
+                } if stats_type == 'goals' else {},
+                "last_matches": []
             },
             "metadata": self._build_metadata([], params)
         }
